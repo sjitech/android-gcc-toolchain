@@ -1,0 +1,39 @@
+#!/bin/bash
+EXE_NAME=${0##*/}
+function _msg { echo "[final-wrapper-$EXE_NAME]" "$@" >&2; }
+function _dbg { [[ $AGCC_DBG == 1 ]] && _msg "$@"; }
+
+_EXE=""; case $OSTYPE in msys|cygwin) _EXE=.exe;; esac
+
+EXE_PATH=${0%/*}/$ARCH_PREFIX$EXE_NAME$_EXE
+
+###############################################################################
+#output command line
+
+CCACHE=""; [[ $USE_CCACHE == 1 ]] && case $EXE_NAME in gcc|g++|cc|c++|clang|clang++) CCACHE=ccache;; esac
+
+if [[ $AGCC_VERBOSE == 1 || $AGCC_DBG == 1 ]]; then
+    function _raw_msg { echo "$@" >&2; }
+
+    _raw_msg '$___' $CCACHE "'$EXE_PATH'" \\
+
+    spaces='$___    '
+
+    i=0
+    for arg in "$@"; do
+        ((i++))
+        arg=${arg//\'/\\\'} #replace ' with \'
+        if [[ $i == $# ]]; then
+            _raw_msg "$spaces" "'$arg'"
+        else
+            _raw_msg "$spaces" "'$arg'" \\
+        fi
+    done
+
+    [[ $# == 0 ]] && _raw_msg ""
+fi
+
+###############################################################################
+#run command via ccache
+
+exec $CCACHE "$EXE_PATH" "$@"

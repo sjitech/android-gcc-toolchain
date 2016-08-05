@@ -1,0 +1,702 @@
+#!/bin/bash
+function _msg { echo "$@" >&2; }
+function _dbg { [[ $AGCC_DBG == 1 ]] && echo "$@" >&2; }
+function _guide { echo "" "$@" >&2; }
+
+VERSION=2.2
+
+_EXE=""; case $OSTYPE in msys|cygwin) _EXE=.exe;; esac
+
+thisDir=${0%/*}; [[ $0 != */* ]] && thisDir=.
+if target=`readlink "$0"`; then if [[ $target == /* ]]; then thisDir=${target%/*}; elif [[ $target == */* ]]; then thisDir+=/${target%/*}; fi; fi
+_dbg "thisDir: '$thisDir'"
+hackDir=$thisDir/host
+
+[[ ! $NDK ]] && for d in "$ANDROID_NDK_ROOT" "$ANDROID_NDK_HOME" "$NDK_ROOT" "$NDKROOT" "$ANDROID_NDK"; do
+    [[ $d ]] && export NDK=$d && break
+done
+[[ ! $NDK ]] && for d in "$ANDROID_SDK_HOME" "$ANDROID_SDK_ROOT" "$ANDROID_SDK" "$ANDROID_HOME" "$ANDROID_ROOT"; do
+    [[ $d ]] && export NDK=$d/ndk-bundle && break
+done
+
+ARCH=""; APIL=""; STL=""; FORCE=""; ENV_MODE=""; CMD=""; HACK=""; HACK_LIST=(); VERBOSE=""; COPY="";
+
+while [[ $# -gt 0 ]]; do
+    _dbg "'$1'"
+    case $1 in
+    --arch) case $2 in arm|arm64|x86|x86_64|mips|mips64|i386|ia32|x64|mipsel|mipsel64) ARCH=$2; _dbg " ARCH='$2'"; shift;;
+            ""|-*) _msg "expect arch behind $1. Must be arm(default)|arm64|x86|x86_64|mips|mips64 or aliases i386|ia32|x64|mipsel|mipsel64"; exit 1;;
+            *) _msg "invalid arch '$2'. Must be arm(default)|arm64|x86|x86_64|mips|mips64 or aliases i386|ia32|x64|mipsel|mipsel64"; exit 1;;
+            esac
+            ;;
+    --api)  case $2 in min|max) APIL=$2; _dbg " APIL='$2'"; shift;;
+            ""|-*) _msg "expect Android API level behind $1. Must be min(default)|max|an integer"; exit 1;;
+            *[!0-9]*) _msg "invalid Android API level '$2'. Must be min(default)|max|an integer"; exit 1;;
+            *) APIL=$2; _dbg " APIL='$2'"; shift;;
+            esac
+            ;;
+    --stl)  case $2 in gnustl|libc++|stlport) STL=$2; _dbg " STL='$2'"; shift;;
+            ""|-*) _msg "expect C++ STL behind $1. Must be gnustl(default)|libc++|stlport"; exit 1;;
+            *) _msg "invalid C++ STL '$2'. Must be gnustl(default)|libc++|stlport"; exit 1;;
+            esac
+            ;;
+    --host) case $2 in
+            ""|-*) _msg "expect host compiler rules behind $1. Must be combination of available rules(use --list-host-rules to show), joined by comma"; exit 1;;
+            *)  HACK=$2; _dbg " HACK='$2'"; shift;;
+            esac
+            ;;
+    --force)
+            FORCE=$1; _dbg " ->FORCE"
+            ;;
+    -v|--verbose)
+            VERBOSE=--verbose; _dbg " ->VERBOSE"
+            ;;
+    --copy)
+            COPY=$1; _dbg " ->COPY"
+            ;;
+    arm|arm64|x86|x86_64|mips|mips64|i386|ia32|x64|mipsel|mipsel64)
+            ARCH=$1; _dbg " ->ARCH"
+            ;;
+    -c|-C)
+            ENV_MODE=$1; _dbg " ->ENV_MODE"
+            ;;
+    -|--)   case $2 in ""|-*) _msg "expect external command behind $1"; exit 1;; esac
+            CMD=$2; _dbg " CMD='$2'"
+            shift; shift
+            break
+            ;;
+    --help|--version|--list-host-rules)
+            break
+            ;;
+    --*)
+            _msg "invalid long option '$1'. Must be --arch|--api|--stl|--force|--verbose|--copy|--host|--version|--help|--list-host-rules"
+            exit 1
+            ;;
+    -*)
+            _msg "invalid short option '$1'. Must be -c(set \$CC...) or -C(set \$CC_target...), or -v(verbose)"
+            exit 1
+            ;;
+    "")
+            _dbg " :skip isolated empty arg"
+            ;;
+    *)
+            CMD=$1; _dbg " ->CMD"
+            shift
+            break
+            ;;
+    esac
+
+    shift
+done
+
+[[ ! $CMD ]] && \
+case $1 in
+--help)
+    _msg "android-gcc-toolchain $VERSION"
+    _msg "Run commands in an android-oriented cross-compile environment."
+    _msg ""
+    _msg "Usage: android-gcc-toolchain [OPTIONS] [CMD [ARGS...]]"
+    _msg "--------------------------------------------------------------------------------"
+    _msg "OPTIONS: for toolchain, env mode, host compiler,..."
+    _msg ""
+    _msg "Toolchain options: specify which toolchain to use or create"
+    _msg " [--arch] ARCH  Android architecture:"
+    _msg "                {arm(default)|arm64|x86|x86_64|mips|mips64} or aliases:"
+    _msg "                i386,ia32(=x86), x64(=x86_64), mipsel, mipsel64"
+    _msg " --api    APIL  Android API level:"
+    _msg "                {min(default)|max|an integer}"
+    _msg " --stl    STL   C++ STL to use:"
+    _msg "                {gnustl(default)|libc++|stlport}"
+    _msg " --force        Delete existing toolchain dir then create"
+    _msg " --copy         Force copy files instead of create hard link of files when"
+    _msg "                create toolchain first time"
+    _msg ""
+    _msg "Env mode options: Specify whether set \$PATH or \$CC... or \$CC_target..."
+    _msg " omitted        This is the Redirect mode."
+    _msg "                Set \$PATH to redirect gcc... to the toolchain's gcc..."
+    _msg "                e.g. export PATH=\$NDK/std-toolchains/.../bin:\$PATH"
+    _msg " -c             Set \$CC,\$CXX,\$LINK,\$AR,\$AS,\$RANLIB,\$LD,\$STRIP,\$NM"
+    _msg "                e.g. export CC=\$NDK/std-toolchains/.../bin/gcc"
+    _msg " -C             Set \$CC_target,\$CXX_target,\$LINK_target,...,\$NM_target"
+    _msg "                e.g. export CC_target=\$NDK/std-toolchains/.../bin/gcc"
+    _msg ""
+    _msg "Host compiler option: Add/remove options to host compiler forcibly"
+    _msg " --host  RULES  Mandatory host compiler rules. Must be a comma joined "
+    _msg "                combination of available rules(Use --list-host-rules to show)."
+    _msg "                This is done by supersede host compiler in \$PATH by some"
+    _msg "                wrapper scripts to add/remove option then transfer to original."
+    _msg ""
+    _msg "Other options:"
+    _msg " -v, --verbose  Show verbose information, include compiler arguments"
+    _msg " --version      Show version of this tool"
+    _msg "--------------------------------------------------------------------------------"
+    _msg "CMD and ARGS: The external command to be run"
+    _msg ""
+    _msg " CMD            Any command. Default is /bin/bash."
+    _msg "                To avoid ambiguous with other option, place - or -- before CMD"
+    _msg " ARGS...        The arguments for the CMD"
+    _msg "--------------------------------------------------------------------------------"
+    _msg "Environment variables affecting this tool"
+    _msg ""
+    _msg " USE_CCACHE=1   Compilers(gcc/g++/cc/c++/clang/clang++) will run via ccache"
+    _msg " AGCC_VERBOSE=1 Compilers(include ar as ranlib ld strip nm) will show arguments"
+    _msg "--------------------------------------------------------------------------------"
+    _msg "Quick examples"
+    _msg ""
+    _msg "#### compile a.c with android's gcc"
+    _msg "android-gcc-toolchain arm64 gcc a.c"
+    _msg ""
+    _msg "#### start an interactive shell with gcc... ready"
+    _msg "android-gcc-toolchain arm64                               #bash"
+    _msg "android-gcc-toolchain arm64 zsh                           #zsh"
+    _msg ""
+    _msg "#### start an interactive bash with \$CC... predefined"
+    _msg "android-gcc-toolchain arm64 -c"
+    _msg ""
+    _msg "#### start an interactive bash with \$CC_target... predefined"
+    _msg "android-gcc-toolchain arm64 -C"
+    _msg ""
+    _msg "#### cross-compile ffmpeg"
+    _msg "android-gcc-toolchain arm64 <<<\"./configure --enable-cross-compile --arch=arm64 --target-os=linux \$OTHER_OPTIONS && make\""
+    _msg ""
+    _msg "#### cross-compile nodejs with \$CC_target... ready and host compiler rules applied forcibly (on Mac)"
+    _msg "android-gcc-toolchain arm64 --host ar-dual-os,gcc-no-librt -C <<<\"./configure --dest-cpu=arm64 --dest-os=android && make\""
+    _msg ""
+    _msg "See README.md, https://github.com/sjitech/android-gcc-toolchain"
+    exit 0
+    ;;
+--list-host-rules)
+    _msg "Available host compiler rules:"
+    for d in "$hackDir"/*; do
+        [[ $d == *\** ]] && break
+        [[ $d == */-* ]] && continue;
+        _msg " ${d##$hackDir/}"
+    done
+    _msg "See README.md, https://github.com/sjitech/android-gcc-toolchain#host-option"
+    exit 0
+    ;;
+--version)
+    _msg $VERSION
+    exit 0
+    ;;
+esac
+
+if [[ $AGCC_DBG == 1 ]]; then
+    _dbg "args {"
+    _dbg " ARCH     $ARCH"
+    _dbg " APIL     $APIL"
+    _dbg " STL      $STL"
+    _dbg " FORCE    $FORCE"
+    _dbg " VERBOSE  $VERBOSE"
+    _dbg " COPY     $COPY"
+    _dbg " HACK     $HACK"
+    _dbg " ENV_MODE $ENV_MODE"
+    _dbg " CMD      $CMD"
+    _dbg " #ARGS    $#"
+    _dbg "}"
+fi
+
+################################################################################
+#check arch and cross-compile executable's name prefix
+case ${ARCH:=arm} in
+    arm)    ARCH_PREFIX=arm-linux-androideabi- ;;
+    arm64)  ARCH_PREFIX=aarch64-linux-android- ;;
+    x86|i386|ia32)   ARCH=x86;    ARCH_PREFIX=i686-linux-android- ;;
+    x86_64|x64)      ARCH=x86_64; ARCH_PREFIX=x86_64-linux-android- ;;
+    mips|mipsel)     ARCH=mips;   ARCH_PREFIX=mipsel-linux-android- ;;
+    mips64|mipsel64) ARCH=mips64; ARCH_PREFIX=mips64el-linux-android- ;;
+    *) _msg "invalid arch '$ARCH'. Must be arm(default)|arm64|x86|x86_64|mips|mips64 or aliases i386|ia32|x64|mipsel|mipsel64"; exit 1 ;;
+esac
+
+################################################################################
+#check Android API level
+minAPIL=""
+case ${APIL:=min} in
+    min|max)
+        [[ ! $NDK ]] && { _msg "\$NDK not set. Can not guess from \$ANDROID_NDK_ROOT, \$ANDROID_SDK_HOME,... Please run: export NDK=dir_of_NDK"; exit 1; }
+        dirPrefix=$NDK/platforms/android-
+        dirSuffix=/arch-$ARCH
+        dirList=() #save ordered dir list
+
+        #glob dir list, add to dirList if globed.
+        tmpList=("$dirPrefix"?$dirSuffix)
+        [[ ${tmpList[0]} != *\?* ]] && dirList+=("${tmpList[@]}")
+        tmpList=("$dirPrefix"??$dirSuffix)
+        [[ ${tmpList[0]} != *\?* ]] && dirList+=("${tmpList[@]}")
+        tmpList=("$dirPrefix"???$dirSuffix)
+        [[ ${tmpList[0]} != *\?* ]] && dirList+=("${tmpList[@]}")
+
+        #get first or last dir name, e.x. ...android-9/arch-... or ...android-24/arch-...
+        if [[ $APIL == min ]]; then
+            APIL=${dirList[0]}
+            minAPIL=$APIL
+        else
+            APIL=${dirList[${#dirList[@]}-1]}
+        fi
+
+        #remove prefix and suffix to get pure number
+        APIL=${APIL#$dirPrefix}
+        APIL=${APIL%$dirSuffix}
+
+        [[ ! $APIL ]] && { _msg "invalid NDK. The platforms/android-*/arch-$ARCH not found at \$NDK($NDK)"; exit 1; }
+        [[ $minAPIL ]] && minAPIL=$APIL
+        ;;
+    *[!0-9]*)
+        _msg "invalid Android API level '$APIL'. Must be min(default)|max|an integer"; exit 1
+        ;;
+esac
+
+################################################################################
+#check C++ STL
+case ${STL:=gnustl} in
+    gnustl ) STL_TAG="" ;;
+    libc++ ) STL_TAG=-libc++ ;;
+    stlport) STL_TAG=-stlport ;;
+    *) _msg "invalid C++ STL '$STL'. Must be gnustl(default)|libc++|stlport"; exit 1 ;;
+esac
+
+################################################################################
+#check USE_CCACHE
+if [[ $USE_CCACHE == 1 ]]; then
+    type -p ccache > /dev/null || { unset USE_CCACHE; _msg "\$USE_CCACHE=1 but ccache is not found in \$PATH"; }
+fi
+
+################################################################################
+#check host compiler rules
+if [[ $HACK || $ENV_MODE ]]; then
+
+    hoList=()
+    if [[ $HACK ]]; then
+        #replace comma with space, then convert to array, then remote empty items
+        hoList=(${HACK//,/ }); hoList=(${hoList[@]})
+        [[ ! ${hoList[0]} ]] && { _msg "invalid host compiler rules '$HACK'. Use --list-host-rules to show available rules"; exit 1; }
+    fi
+
+    function already_checked { local ho; for ho in "${HACK_LIST[@]}"; do [[ $1 == $ho ]] && return 0; done; return 1; }
+
+    #append internal host compiler rule "-compilers" to list.
+    #check each item of the combined list
+    for ho in "${hoList[@]}"; do
+        [[ $ho == -* || $ho == */* || $ho == . || $ho == .. || ! -d $hackDir/$ho ]] && { _msg "invalid host compiler rule '$ho'. Use --list-host-rules to show available rules"; exit 1; }
+        already_checked "$ho" || HACK_LIST+=($ho)
+    done
+
+    [[ $ENV_MODE ]] && HACK_LIST+=(-compilers)
+fi
+
+################################################################################
+if [[ $AGCC_DBG == 1 ]]; then
+    _dbg "args {"
+    _dbg " ARCH     $ARCH"
+    _dbg " APIL     $APIL"
+    _dbg " STL      $STL"
+    _dbg " FORCE    $FORCE"
+    _dbg " VERBOSE  $VERBOSE"
+    _dbg " COPY     $COPY"
+    _dbg " HACK     $HACK"
+    _dbg " HACK_LIST(${HACK_LIST[@]})"
+    _dbg " ENV_MODE $ENV_MODE"
+    _dbg " CMD      $CMD"
+    _dbg " #ARGS    $#"
+    _dbg "}"
+fi
+
+################################################################################
+#create or check standalone toolchain
+[[ ! $NDK ]] && { _msg "\$NDK is not set. Can not guess from \$ANDROID_NDK_ROOT, \$ANDROID_SDK_HOME,... Please run: export NDK=dir_of_NDK"; exit 1; }
+TC_NAME=android-$APIL-$ARCH$STL_TAG
+TC_TOP=$NDK/std-toolchains/$TC_NAME
+BIN=$TC_TOP/bin
+BIN_ARCH_PREFIX=$BIN/$ARCH_PREFIX
+
+#the $NDK/prebuilt/*/bin contains python make awk,
+# append it to $PATH to ensure python can be found even if no existing one
+fileList=("$NDK"/prebuilt/*/bin/python)
+[[ ${fileList[0]} == *\** ]] && { _msg "invalid NDK. The prebuilt/*/bin/python not found at \$NDK($NDK)"; exit 1; }
+PREBUILT_BIN=${fileList[0]%/*}; _dbg "NDK prebuilt bin dir confirmed: $PREBUILT_BIN"
+case $PATH in *:$PREBUILT_BIN:*|*:$PREBUILT_BIN|$PREBUILT_BIN:*) _dbg "already in \$PATH";;
+    *) export PATH=$PATH:$PREBUILT_BIN; _dbg "appended to \$PATH"
+esac
+
+if [[ ! -d $TC_TOP || $FORCE ]]; then
+    _msg "Make std-toolchains/$TC_NAME at \$NDK($NDK)"
+
+    #try to extract platform files from compressed file.
+    extracted=""
+    if [[ ! -d $NDK/platforms/android-$APIL/arch-$ARCH/usr && -f $NDK/platforms.7z ]]; then
+        if type -p 7z >/dev/null; then
+            _msg "Extract platforms/android-$APIL/arch-$ARCH/usr/* from \$NDK/platforms.7z"
+            ( \
+                cd "$NDK" \
+                && { [[ -d tmp ]] || mkdir tmp; } \
+                && cd tmp \
+                && 7z x -y ../platforms.7z platforms/android-$APIL/arch-$ARCH/usr \
+                | grep -vE '^Extracting|^Skipping|^$'; \
+                exit ${PIPESTATUS[0]} \
+            ) \
+            && mv -f "$NDK"/tmp/platforms/android-$APIL/arch-$ARCH/usr "$NDK"/platforms/android-$APIL/arch-$ARCH/ \
+            && extracted=YES
+        else
+            _msg "The platform files(\$NDK/platforms/android-$APIL/arch-$ARCH/usr/) does not exists," \
+            _msg "so trying to extract files from \$NDK/platforms.7z with 7z."
+            _msg "Unfortunately 7z not found. Please install 7z."
+        fi
+    fi
+
+    [[ $FORCE ]] && { rm -fr "$TC_TOP" || mv -f "$TC_TOP" "$TC_TOP".old; }
+
+    PY_FILE=$NDK/build/tools/make_standalone_toolchain.py
+    if [[ $COPY ]]; then
+        "$PY_FILE" --arch $ARCH --api $APIL --stl $STL --install-dir "$TC_TOP" $VERBOSE
+        results=($? 0)
+    else
+        #use hard link as possible. Use customized copy2 and copytree to replace shutil.copy2 and shutil.copytree
+        { cat "$thisDir"/lib/fast-copy.py \
+        && sed "s/__file__/os.environ['PY_FILE']/g;s/shutil\.copy2/copy2/g;s/shutil\.copytree/copytree/g" "$PY_FILE" \
+        ; } | VERBOSE=$VERBOSE PY_FILE=$PY_FILE python - --arch $ARCH --api $APIL --stl $STL --install-dir "$TC_TOP" $VERBOSE
+        results=("${PIPESTATUS[@]}")
+    fi
+
+    [[ $extracted ]] && rm -fr "$NDK"/platforms/android-$APIL/arch-$ARCH/usr
+
+    [[ ${results[0]} != 0 ]] && exit ${results[0]};
+    [[ ${results[1]} != 0 ]] && exit ${results[1]};
+
+    if [[ -f "$BIN_ARCH_PREFIX"gcc$_EXE && -x "$BIN_ARCH_PREFIX"gcc$_EXE ]]; then
+        _msg "Done"
+    else
+        _msg "Failed to create toolchain."
+        _msg "Please use --force --verbose to recreate toolchain."
+        exit 1
+    fi
+elif [[ ! -f "$BIN_ARCH_PREFIX"gcc$_EXE && -x "$BIN_ARCH_PREFIX"gcc$_EXE ]]; then
+    _msg "invalid toolchain. The ${BIN_ARCH_PREFIX/#$NDK/}gcc$_EXE not found at \$NDK($NDK) or not executable."
+    _msg "Please use --force --verbose to recreate toolchain."
+    exit 1
+fi
+
+#create symbol links or wrapper scripts such as gcc for arm-linux-androideabi-gcc
+if [[ ! -f "$BIN"/.final-wrapper-created ]]; then
+
+    #copy *-gcc as *-cc
+    ln -f "$BIN_ARCH_PREFIX"gcc$_EXE "$BIN_ARCH_PREFIX"cc$_EXE || exit
+
+    #create gcc wrapper
+    s=gcc
+    sed "s/\$ARCH_PREFIX/$ARCH_PREFIX/g" "$thisDir"/android/compiler-wrapper > "$BIN"/$s.tmp || exit
+    chmod a+x "$BIN"/$s.tmp || exit
+    mv -f "$BIN"/$s.tmp "$BIN"/$s || exit
+
+    for f in "$BIN_ARCH_PREFIX"*$_EXE; do
+        [[ $f == *\** ]] && break
+        s=${f#$BIN_ARCH_PREFIX} #$BIN/arm-linux-androideabi-gcc.exe -> gcc.exe
+        s=${s%$_EXE} #remove trailing ".exe"
+
+        case $s in
+        gcc)
+            ;;
+        g++|cc|c++|clang|clang++|ar|as|ranlib|ld|strip|nm)
+            ln -sf gcc "$BIN"/$s || exit
+            ;;
+        *)
+            ln -sf $ARCH_PREFIX$s$_EXE "$BIN"/$s || exit
+            ;;
+        esac
+    done
+
+    #get min Android API level
+    if [[ $STL == gnustl && ! $minAPIL ]]; then
+        dirPrefix=$NDK/platforms/android-
+        dirSuffix=/arch-$ARCH
+        dirList=() #save ordered dir list
+        #glob dir list, add to dirList if globed.
+        tmpList=("$dirPrefix"?$dirSuffix)
+        [[ ${tmpList[0]} != *\?* ]] && dirList+=("${tmpList[@]}")
+        tmpList=("$dirPrefix"??$dirSuffix)
+        [[ ${tmpList[0]} != *\?* ]] && dirList+=("${tmpList[@]}")
+        tmpList=("$dirPrefix"???$dirSuffix)
+        [[ ${tmpList[0]} != *\?* ]] && dirList+=("${tmpList[@]}")
+        #get first or last dir name, e.x. ...android-9/arch-... or ...android-24/arch-...
+        minAPIL=${dirList[0]}
+        #remove prefix and suffix to get pure number
+        minAPIL=${minAPIL#$dirPrefix}
+        minAPIL=${minAPIL%$dirSuffix}
+    fi
+
+    if [[ $STL != gnustl || $APIL != $minAPIL ]]; then
+
+        #try to calculate a consistent timestamp based on STL and APIL and minAPIL
+        year=2000; [[ ! $minAPIL || $APIL -lt $minAPIL ]] && { minAPIL=0; year=1999; }
+        case $STL in gnustl) month=01;; libc++) month=03;; *) month=05;; esac
+        ((day=(APIL-minAPIL)%30+1)); [[ ${#day} == 1 ]] && day=0$day
+        ((almostZero=(APIL-minAPIL)/30));
+        ((hour=almostZero%60)); [[ ${#hour} == 1 ]] && hour=0$hour
+        ((almostZero=almostZero/60));
+        ((minute=almostZero%60)); [[ ${#minute} == 1 ]] && minute=0$minute
+        timestamp=$year$month$day$hour$minute
+        _dbg set gcc $timestamp
+
+        # By default CCACHE does not cache hash of system include files, while for toolchains with
+        # same arch but different C++ STL or Android API level, the system include files changes, but
+        # the compilers are still same, so CCACHE will be confused about compile result from different toolchains.
+        # To avoid this problem, i have to make the compilers of each toolchain have a unique timestamp, e.g.
+        # 2000/01/01/STL:APIL:00
+        for s in gcc g++ cc c++ clang clang++; do
+            f=$ARCH_PREFIX$s$_EXE
+            cp -pf "$BIN"/$f "$BIN"/$f.tmp \
+            && touch -t $timestamp "$BIN"/$f.tmp \
+            && mv -f "$BIN"/$f.tmp "$BIN"/$f
+        done
+    else
+        #clang/clang++ are wrapper script created by make_standalone_toolchain.py at calling time,
+        # so the timestamp need be keep being same (as gcc), no matter when create toolchain
+        touch -r "$BIN_ARCH_PREFIX"gcc$_EXE "$BIN_ARCH_PREFIX"clang$_EXE "$BIN_ARCH_PREFIX"clang++$_EXE
+    fi
+
+    touch "$BIN"/.final-wrapper-created
+fi
+
+#do not want toolchain's python make awk take precedence of existing one.
+# So remove them. They are provided at $NDK/prebuilt/*/bin which are already appended to $PATH
+if [[ ! -f $BIN/.python_make_awk_removed ]]; then
+    for f in "$PREBUILT_BIN"/*; do
+        [[ $f == *\** ]] && break
+        f=$BIN/${f##*/}  # "$PREBUILT_BIN"/file -> "$BIN"/file
+        [[ -f $f ]] && { rm -f "$f" || mv -f "$f" "$f"_; }
+    done
+    touch "$BIN"/.python_make_awk_removed
+fi
+
+#fix possible bug of android-mips: g++ -mips32r2 option cause error "bits/c++config.h" not found.
+#so merge .../*/bits/*.h to standard place .../bits/
+if [[ $ARCH == mips && $STL == gnustl && ! -f $BIN/../.bits_h_merged ]]; then
+    ln -f "$BIN"/../include/c++/?.?.?/*/bits/*.h "$BIN"/../include/c++/?.?.?/bits/ \
+    && touch "$BIN"/../.bits_h_merged
+fi
+
+#add std::snprintf to <cstdio> so make it compatible with libc++
+if [[ $STL == gnustl && ! -f $BIN/../.std_snprintf_added_to_cstdio ]]; then
+    "$BIN_ARCH_PREFIX"g++$_EXE -E -x c++ - <<< "#include <cstdio>" | grep -q 'using ::snprintf'
+    results=("${PIPESTATUS[@]}")
+    if [[ ${results[0]} == 0 ]]; then
+        if [[ ${results[1]} == 0 ]]; then
+            touch "$BIN"/../.std_snprintf_added_to_cstdio
+        else
+            f=("$BIN"/../include/c++/?.?.?/cstdio)
+            awk '/using ::printf;/{print $0 RS "#undef snprintf" RS "using ::snprintf;"; next}1' "$f" > "$f".tmp \
+            && mv -f "$f".tmp "$f" \
+            && touch "$BIN"/../.std_snprintf_added_to_cstdio
+        fi
+    fi
+fi
+
+#add std::snprintf to <string> so make it compatible with libc++
+if [[ $STL == gnustl && ! -f $BIN/../.cstdio_added_to_string ]]; then
+    "$BIN_ARCH_PREFIX"g++$_EXE -E -x c++ - <<< "#include <string>" | grep -q 'using ::snprintf'
+    results=("${PIPESTATUS[@]}")
+    if [[ ${results[0]} == 0 ]]; then
+        if [[ ${results[1]} == 0 ]]; then
+            touch "$BIN"/../.cstdio_added_to_string
+        else
+            f=("$BIN"/../include/c++/?.?.?/string)
+            { cat "$f" && echo && echo '#include <cstdio>'; } > "$f".tmp \
+            && mv -f "$f".tmp "$f" \
+            && touch "$BIN"/../.cstdio_added_to_string
+        fi
+    fi
+fi
+
+################################################################################
+#otherwise, prepare env then run command
+
+
+
+
+
+
+
+
+################################################################################
+#check verbose mode or interactive bash just for show guide and prompt
+INTER_BASH=""; [[ ! $CMD && -t 0 && -t 2 ]] && INTER_BASH=YES
+GUIDE=""; [[ $VERBOSE || $INTER_BASH ]] && GUIDE=YES
+_dbg "GUIDE: ${GUIDE:-NO} INTER_BASH: ${INTER_BASH:-NO}"
+
+################################################################################
+#remove previous bin path from $PATH
+if [[ $AGCC_BIN ]]; then
+
+    [[ $GUIDE ]] && oldStr=$PATH
+
+    d=$AGCC_BIN
+    PATH=${PATH//:$d:/:}    #replace :dir: with :
+    PATH=${PATH#$d:}        #remove   dir: from head
+    PATH=${PATH%:$d}        #remove  :dir  from tail
+
+    [[ $GUIDE && $oldStr != $PATH ]] && _guide "PATH -= ${AGCC_BIN/#$NDK/\$NDK}"
+fi
+unset AGCC_BIN
+
+################################################################################
+#remove previous hack dir from $PATH
+if [[ $AGCC_HOST_COMPILERS_DIR ]]; then
+
+    for d in "$AGCC_HOST_COMPILERS_DIR"/*; do
+        [[ $d == *\** ]] && break; #means dir not expanded
+
+        [[ $GUIDE ]] && oldStr=$PATH
+
+        PATH=${PATH//:$d:/:}    #replace :dir: with :
+        PATH=${PATH#$d:}        #remove   dir: from head
+        PATH=${PATH%:$d}        #remove  :dir  from tail
+
+        [[ $GUIDE && $oldStr != $PATH ]] && _guide "PATH -= $d"
+    done
+fi
+unset AGCC_HOST_COMPILERS_DIR
+
+################################################################################
+#clear some maybe-inherited var
+unset CC CXX LINK AR AS RANLIB LD STRIP NM
+unset CC_target CXX_target LINK_target AR_target AS_target RANLIB_target LD_target STRIP_target NM_target
+unset GYP_DEFINES PS1
+
+################################################################################
+#save bin dir for cleaner and as mnemonics
+export AGCC_BIN=$BIN
+export BIN
+
+if [[ $GUIDE ]]; then
+    tmpStr="$TC_NAME toolchain is ready! The bin dir(\$BIN) is:"
+    _guide "${tmpStr//?/-}"  #replace each char with -
+    _guide "$tmpStr"
+    _guide " ${BIN/#$NDK/\$NDK}"
+    _guide ""
+fi
+
+################################################################################
+
+#set verbose output for host -compilers/* and android $BIN/gcc... which print arguments
+[[ $VERBOSE ]] && export AGCC_VERBOSE=1
+
+#set gyp host_os to explicitly set it so correctly choose source files
+case $OSTYPE in
+    darwin*) export GYP_DEFINES="host_os=mac" ;;
+    linux*)  export GYP_DEFINES="host_os=linux" ;;
+    msys|cygwin)  export GYP_DEFINES="host_os=$OSTYPE" ;;
+    *)  export GYP_DEFINES="host_os=$OSTYPE"
+        _dbg "unsupported OSTYPE '$OSTYPE', so just set GYP_DEFINES=\"host_os=$OSTYPE\"" ;;
+esac
+
+#if $NDK contains spaces, then should be quoted in $CC... $CC_target...
+q=""; Q=""; [[ $NDK == *\ * ]] && q=\" && Q=\\\"
+
+case $ENV_MODE in
+################################################################################
+"")  #$PATH mode(redirect mode)
+    export PATH=$BIN:$PATH
+
+    if [[ $GUIDE ]]; then
+        _guide "PATH=\$BIN:\$PATH. Toolchain commands can be used directly:"
+        _guide " gcc g++ cc c++ clang clang++ ar as ranlib ld strip nm ..."
+        _guide " readelf objdump c++filt elfedit objcopy strings size ..."
+        _guide ""
+
+        #change prompt
+        PS1="[$TC_NAME] ";
+    fi
+    ;;
+################################################################################
+-c) #$CC mode
+    export CC=$q$BIN/gcc$q
+    export CXX=$q$BIN/g++$q
+    export LINK=$q$BIN/g++$q
+    export AR=$q$BIN/ar$q
+    export AS=$q$BIN/as$q
+    export RANLIB=$q$BIN/ranlib$q
+    export LD=$q$BIN/ld$q
+    export STRIP=$q$BIN/strip$q
+    export NM=$q$BIN/nm$q
+
+    if [[ $GUIDE ]]; then
+        _guide "Following env vars have been exported:"
+        _guide " export CC=$Q\$BIN/gcc$Q"
+        _guide " export CXX=$Q\$BIN/g++$Q"
+        _guide " export LINK=$Q\$BIN/g++$Q"
+        _guide " export AR=$Q\$BIN/ar$Q"
+        _guide " export AS=$Q\$BIN/as$Q"
+        _guide " export RANLIB=$Q\$BIN/ranlib$Q"
+        _guide " export LD=$Q\$BIN/ld$Q"
+        _guide " export STRIP=$Q\$BIN/strip$Q"
+        _guide " export NM=$Q\$BIN/nm$Q"
+        _guide ""
+
+        #change prompt
+        PS1="[$TC_NAME \\\$CC] ";
+    fi
+    ;;
+################################################################################
+-C) #$CC_target mode
+    export CC_target=$q$BIN/gcc$q
+    export CXX_target=$q$BIN/g++$q
+    export LINK_target=$q$BIN/g++$q
+    export AR_target=$q$BIN/ar$q
+    export AS_target=$q$BIN/as$q
+    export RANLIB_target=$q$BIN/ranlib$q
+    export LD_target=$q$BIN/ld$q
+    export STRIP_target=$q$BIN/strip$q
+    export NM_target=$q$BIN/nm$q
+
+    if [[ $GUIDE ]]; then
+        _guide "Following env vars have been exported:"
+        _guide " export CC_target=$Q\$BIN/gcc$Q"
+        _guide " export CXX_target=$Q\$BIN/g++$Q"
+        _guide " export LINK_target=$Q\$BIN/g++$Q"
+        _guide " export AR_target=$Q\$BIN/ar$Q"
+        _guide " export AS_target=$Q\$BIN/as$Q"
+        _guide " export RANLIB_target=$Q\$BIN/ranlib$Q"
+        _guide " export LD_target=$Q\$BIN/ld$Q"
+        _guide " export STRIP_target=$Q\$BIN/strip$Q"
+        _guide " export NM_target=$Q\$BIN/nm$Q"
+        _guide ""
+
+        #change prompt
+        PS1="[$TC_NAME \\\$CC_target] "
+    fi
+esac
+
+################################################################################
+#Supersede host compiler by prioritized wrappers in $PATH
+if [[ ${#HACK_LIST[@]} -gt 0 ]]; then
+    #save hack dir for cleaner
+    export AGCC_HOST_COMPILERS_DIR=$hackDir
+
+    ((i=${#HACK_LIST[@]}-1))
+    while ((i>=0)); do
+        ho=${HACK_LIST[$i]}
+        export PATH=$hackDir/$ho:$PATH
+        [[ $GUIDE ]] && _guide "PATH=$hackDir/$ho:\$PATH"
+        ((i--))
+    done
+    [[ $GUIDE ]] && _guide ""
+
+    #change prompt, replace "]" with "+]"
+    [[ $GUIDE ]] && PS1="${PS1/#]/+]}"
+fi #end of HACK_LIST
+
+################################################################################
+#finally, call CMD or bash. "exec" is to overwrite current process
+if [[ $INTER_BASH ]]; then
+    #forcibly set my prompt ($PS1) via an on-fly init-file yet simulate interactive non-login bash
+    exec /bin/bash --init-file <(
+        echo '[[ -f /etc/bash.bashrc ]] && source /etc/bash.bashrc'
+        echo '[[ -f ~/.bashrc ]] && source ~/.bashrc'
+        echo "PS1='$PS1'"
+    )
+else
+    if [[ $CMD ]]; then
+        exec "$CMD" "$@"
+    else
+        exec /bin/bash
+    fi
+fi

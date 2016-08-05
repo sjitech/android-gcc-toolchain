@@ -1,0 +1,70 @@
+#!/bin/bash
+EXE_NAME=ar
+function _msg { echo "[ar-dual-os]" "$@" >&2; }
+function _dbg { [[ $AGCC_DBG == 1 ]] && _msg "$@"; }
+
+###############################################################################
+#Search the exe behind me in $PATH. Even faster than {for f in `type -ap name`}
+
+IFS=: pathList=($PATH); unset IFS  #split $PATH by :, save to array
+
+EXE_PATH=""; foundMyself=""
+for d in "${pathList[@]}"; do
+    if [[ -f $d/$EXE_NAME && -x $d/$EXE_NAME ]]; then
+        if [[ $d/$EXE_NAME -ef "$0" ]]; then #is it actually myself? (symbol link also works)
+            foundMyself=YES
+        elif [[ $foundMyself ]]; then
+            EXE_PATH=$d/$EXE_NAME
+            break
+        fi
+    fi
+done
+
+if [[ ! $EXE_PATH ]]; then
+    _msg "$EXE_NAME not found."
+    exit 127
+fi
+
+###############################################################################
+#get path of target-side ar and objdump from \$AR_target
+
+if [[ ! $AR_target ]]; then
+    _msg "AR_target not defined."
+    exit 1
+fi
+
+#AR_target maybe contains quot itself, so remove it first
+AR_target="${AR_target//\"}"
+#replace last "ar" with "objdump"
+objdump=${AR_target/%ar/objdump}
+
+###############################################################################
+#get non-zero a *.o file from arguments
+
+OBJ_FILE=""
+for f in "$@"; do
+    if [[ ${f/*.} == o && -s $f ]]; then
+        OBJ_FILE=$f
+        break
+    fi
+done
+
+###############################################################################
+#use target objdump to test .o file, if OK, then run target ar
+
+if [[ $OBJ_FILE ]]; then
+    _dbg "check '$OBJ_FILE' by run '$objdump' -a on it"
+    if "$objdump" -a "$OBJ_FILE" >/dev/null 2>/dev/null; then
+        _msg "call '$AR_target'"
+        exec "$AR_target" "$@"
+        exit
+    fi
+else
+    _msg "no any non-empty *.o file provided for type check."
+fi
+
+###############################################################################
+#otherwise call host ar
+
+_msg "call '$EXE_PATH'"
+exec "$EXE_PATH" "$@"

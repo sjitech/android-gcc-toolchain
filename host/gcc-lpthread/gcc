@@ -1,0 +1,64 @@
+#!/bin/bash
+EXE_NAME=${0##*/}
+function _msg { echo "[$EXE_NAME-lpthread]" "$@" >&2; }
+function _dbg { [[ $AGCC_DBG == 1 ]] && _msg "$@"; }
+
+###############################################################################
+#Search the exe behind me in $PATH. Even faster than {for f in `type -ap name`}
+
+case $EXE_NAME in
+cc) ALT_EXE_NAME="gcc";;
+gcc) ALT_EXE_NAME="cc";;
+c++) ALT_EXE_NAME="g++";;
+g++) ALT_EXE_NAME="c++";;
+*) unset ALT_EXE_NAME;;
+esac
+
+IFS=: pathList=($PATH); unset IFS  #split $PATH by :, save to array
+
+for name in $EXE_NAME $ALT_EXE_NAME; do
+    EXE_PATH=""; foundMyself=""
+    for d in "${pathList[@]}"; do
+        if [[ -f $d/$name && -x $d/$name ]]; then
+            if [[ $d/$name -ef "$0" ]]; then #is it actually myself? (symbol link also works)
+                foundMyself=YES
+            elif [[ $foundMyself ]]; then
+                EXE_PATH=$d/$name
+                break
+            fi
+        fi
+    done
+    [[ $EXE_PATH ]] && break;
+done
+
+if [[ ! $EXE_PATH ]]; then
+    _msg "$EXE_NAME${ALT_EXE_NAME+ or }$ALT_EXE_NAME not found."
+    exit 127
+fi
+
+###############################################################################
+#if already have -lpthread option then run command without change.
+
+has_lLIB=""
+for arg in "$@"; do
+    if [[ $arg == -lpthread ]]; then
+        _dbg "call '$EXE_PATH' (already specified -lpthread option)"
+        exec "$EXE_PATH" "$@"
+        exit
+    elif [[ $arg == -l* ]]; then
+        has_lLIB=1
+    fi
+done
+
+#if not sure whether need append -lpthread option then run command without change.
+if [[ ! $has_lLIB ]]; then
+    _dbg "call '$EXE_PATH' (no any -lLIB option)"
+    exec "$EXE_PATH" "$@"
+    exit
+fi
+
+###############################################################################
+#otherwise run command with -lpthread
+
+_msg "call '$EXE_PATH' with -lpthread"
+exec "$EXE_PATH" "$@" -lpthread

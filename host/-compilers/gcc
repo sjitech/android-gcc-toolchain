@@ -1,0 +1,68 @@
+#!/bin/bash
+EXE_NAME=${0##*/}
+function _msg { echo "[final-wrapper-$EXE_NAME]" "$@" >&2; }
+function _dbg { [[ $AGCC_DBG == 1 ]] && _msg "$@"; }
+
+###############################################################################
+#Search the exe behind me in $PATH. Even faster than {for f in `type -ap name`}
+
+case $EXE_NAME in
+cc) ALT_EXE_NAME="gcc";;
+gcc) ALT_EXE_NAME="cc";;
+c++) ALT_EXE_NAME="g++";;
+g++) ALT_EXE_NAME="c++";;
+*) unset ALT_EXE_NAME;;
+esac
+
+IFS=: pathList=($PATH); unset IFS  #split $PATH by :, save to array
+
+for name in $EXE_NAME $ALT_EXE_NAME; do
+    EXE_PATH=""; foundMyself=""
+    for d in "${pathList[@]}"; do
+        if [[ -f $d/$name && -x $d/$name ]]; then
+            if [[ $d/$name -ef "$0" ]]; then #is it actually myself? (symbol link also works)
+                foundMyself=YES
+            elif [[ $foundMyself ]]; then
+                EXE_PATH=$d/$name
+                break
+            fi
+        fi
+    done
+    [[ $EXE_PATH ]] && break;
+done
+
+if [[ ! $EXE_PATH ]]; then
+    _msg "$EXE_NAME${ALT_EXE_NAME+ or }$ALT_EXE_NAME not found."
+    exit 127
+fi
+
+###############################################################################
+#output command line
+
+CCACHE=""; [[ $USE_CCACHE == 1 ]] && case $EXE_NAME in gcc|g++|cc|c++|clang|clang++) CCACHE=ccache;; esac
+
+if [[ $AGCC_VERBOSE == 1 || $AGCC_DBG == 1 ]]; then
+    function _raw_msg { echo "$@" >&2; }
+
+    _raw_msg '$___' $CCACHE "'$EXE_PATH'" \\
+
+    spaces='$___    '
+
+    i=0
+    for arg in "$@"; do
+        ((i++))
+        arg=${arg//\'/\\\'} #replace ' with \'
+        if [[ $i == $# ]]; then
+            _raw_msg "$spaces" "'$arg'"
+        else
+            _raw_msg "$spaces" "'$arg'" \\
+        fi
+    done
+
+    [[ $# == 0 ]] && _raw_msg ""
+fi
+
+###############################################################################
+#run command via ccache
+
+exec $CCACHE "$EXE_PATH" "$@"
